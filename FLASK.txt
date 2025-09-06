@@ -1,0 +1,1196 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+from flask import Flask, jsonify, render_template_string, request, Response
+import time, threading, io, csv, sys, logging, os, glob, stat
+from collections import deque
+from datetime import datetime
+
+# ===== CONFIG BÁSICA =====
+PORTA_SERIAL = os.environ.get('AQUAPULSE_SERIAL', '/dev/ttyACM0')  # export AQUAPULSE_SERIAL=/dev/ttyUSB0 (se quiser)
+BAUD_RATE    = int(os.environ.get('AQUAPULSE_BAUD', '9600'))
+
+# ===== SERIAL (com fallback de simulação) =====
+SIMULADO = False
+SIM_ERR  = None
+ser = None
+try:
+    import serial  # type: ignore
+    try:
+        ser = serial.Serial(PORTA_SERIAL, BAUD_RATE, timeout=1)
+        time.sleep(2)
+        ser.reset_input_buffer()
+    except Exception as e:
+        SIMULADO = True
+        SIM_ERR = repr(e)
+        ser = None
+except Exception as e:
+    SIMULADO = True
+    SIM_ERR = "pyserial não disponível: " + repr(e)
+    ser = None
+
+# ===== ESTADO =====
+estado = {
+    'umidade': 0.0,     # %
+    'modo':   'M',      # 'M' Manual | 'A' Sensor
+    'status': 'umido',  # 'seco' | 'medio' | 'umido'
+    'pump':   False
+}
+
+# ===== CONFIG (em memória) =====
+config = {
+    'umidade_alvo':   65.0,
+    'refresh_ms':     1000,
+
+    # Calibração de vazão (sem sensor)
+    'flow_calibrated': False,
+    'flow_1l_seconds': None,
+    'flow_lpm':        0.0,   # L/min
+    'flow_gauge_max':  15.0
+}
+
+# ===== HISTÓRICO/LOGS EM MEMÓRIA =====
+historico = deque(maxlen=10000)   # amostras (0.5s~1s) ~ “últimas horas”
+eventos   = deque(maxlen=1000)    # eventos (pump/mode/dryness)
+_lock     = threading.Lock()
+
+# ===== INTEGRAÇÃO DE VOLUME =====
+flow_last_ts       = None
+volume_session_l   = 0.0
+volume_today_l     = 0.0
+today_ymd          = datetime.now().strftime('%Y-%m-%d')
+ultimo_pump        = estado['pump']
+
+def _registrar_amostra(ts, est):
+    with _lock:
+        historico.append({
+            'ts': ts,
+            'umidade': float(est.get('umidade', 0.0)),
+            'status':  est.get('status', ''),
+            'pump':    bool(est.get('pump', False)),
+            'modo':    est.get('modo', 'M')
+        })
+
+def _registrar_evento(ts, tipo, valor, meta=None):
+    with _lock:
+        eventos.append({'ts': ts, 'tipo': tipo, 'valor': valor, 'meta': meta or {}})
+
+def _rollover_daily(now: float):
+    global today_ymd, volume_today_l
+    cur = datetime.fromtimestamp(now).strftime('%Y-%m-%d')
+    if cur != today_ymd:
+        today_ymd = cur
+        volume_today_l = 0.0
+
+def _integrar_volume(now: float):
+    """Volume += vazão(L/min) * dt(min), só quando bomba ligada e calibrado."""
+    global flow_last_ts, volume_session_l, volume_today_l
+    _rollover_daily(now)
+
+    if flow_last_ts is None:
+        flow_last_ts = now
+        return
+
+    dt = now - flow_last_ts
+    flow_last_ts = now
+
+    if not config.get('flow_calibrated') or config.get('flow_lpm', 0.0) <= 0.0:
+        return
+    if not estado.get('pump', False):
+        return
+
+    dL = config['flow_lpm'] * (dt / 60.0)
+    if dL < 0:
+        return
+
+    volume_session_l += dL
+    volume_today_l   += dL
+
+def _handle_pump_transition(now: float, novo_p: bool, cause: str = None):
+    """
+    Registra transição de bomba com causa:
+      cause: 'manual' | 'sensor' | 'desconhecido'
+    Evita duplicidade via 'ultimo_pump'.
+    """
+    global ultimo_pump, volume_session_l
+    if novo_p == ultimo_pump:
+        return
+
+    um = float(estado.get('umidade', 0.0))
+    md = estado.get('modo', 'M')
+    c  = cause or ('sensor' if md == 'A' else 'desconhecido')
+
+    if novo_p:
+        # Ligou -> nova sessão
+        volume_session_l = 0.0
+        _registrar_evento(now, 'pump', 'on/' + c, {'umidade': um, 'modo': md})
+    else:
+        # Desligou -> fecha sessão (loga volume da sessão)
+        _registrar_evento(now, 'pump', 'off/' + c, {'umidade': um, 'modo': md, 'vol_sessao': round(volume_session_l, 3)})
+
+    ultimo_pump = novo_p
+
+def leitor_serial():
+    """Lê Serial (ou simula) e atualiza estado + integra volume + histórico + eventos."""
+    global estado, flow_last_ts
+    sim_umidade = 62.0
+    sim_trend   = -0.05
+
+    while True:
+        now = time.time()
+        try:
+            if SIMULADO:
+                # ==== Simulação ====
+                sim_umidade += sim_trend
+                if estado['pump']:
+                    sim_umidade += 0.25
+                if sim_umidade < 15.0: sim_umidade = 15.0
+                if sim_umidade > 95.0: sim_umidade = 95.0
+
+                st = 'seco' if sim_umidade < 35 else ('medio' if sim_umidade < 65 else 'umido')
+
+                # Modo auto: liga/desliga por alvo
+                if estado['modo'] == 'A':
+                    alvo = float(config.get('umidade_alvo', 65))
+                    if sim_umidade < alvo - 1 and not estado['pump']:
+                        estado['pump'] = True
+                        _handle_pump_transition(now, True, cause='sensor')
+                    elif sim_umidade > alvo + 1 and estado['pump']:
+                        estado['pump'] = False
+                        _handle_pump_transition(now, False, cause='sensor')
+
+                estado['umidade'] = float(sim_umidade)
+                if estado.get('status') != st:
+                    _registrar_evento(now, 'status', str(estado.get('status')) + '→' + st, {'umidade': sim_umidade})
+                estado['status']  = st
+
+                _integrar_volume(now)
+                _registrar_amostra(now, estado)
+                time.sleep(0.5)
+                continue
+
+            # ==== Modo Real ====
+            line = ser.readline().decode(errors='ignore').strip() if ser else ''
+            if not line:
+                _integrar_volume(now)
+                time.sleep(0.05)
+                continue
+
+            # Esperado: UM:<v>;MD:<A|M>;ST:<seco|medio|umido>;P:<0|1>
+            parts = {}
+            for chunk in line.split(';'):
+                if ':' in chunk:
+                    k, v = chunk.split(':', 1)
+                    parts[k.strip()] = v.strip()
+
+            if 'UM' in parts:
+                try:
+                    nova = float(parts['UM'])
+                    if abs(nova - estado['umidade']) > 0.001:
+                        estado['umidade'] = nova
+                except:
+                    pass
+
+            if 'MD' in parts and parts['MD'] in ('M','A'):
+                if estado['modo'] != parts['MD']:
+                    _registrar_evento(now, 'modo', parts['MD'])
+                estado['modo'] = parts['MD']
+
+            if 'ST' in parts:
+                if estado['status'] != parts['ST']:
+                    _registrar_evento(now, 'status', str(estado['status']) + '→' + parts['ST'], {'umidade': estado['umidade']})
+                estado['status'] = parts['ST']
+
+            if 'P' in parts:
+                novo_p = (parts['P'] == '1')
+                estado['pump'] = novo_p
+                cause = 'sensor' if estado.get('modo') == 'A' else 'desconhecido'
+                _handle_pump_transition(now, novo_p, cause=cause)
+
+            _integrar_volume(now)
+            _registrar_amostra(now, estado)
+
+        except Exception:
+            time.sleep(0.05)
+
+thr = threading.Thread(target=leitor_serial, daemon=True)
+thr.start()
+
+# ===== FLASK =====
+app = Flask(__name__)
+
+# ---- Logging de requisições ----
+logging.basicConfig(level=logging.INFO, stream=sys.stdout,
+                    format='[%(asctime)s] %(levelname)s: %(message)s')
+
+@app.before_request
+def _dbg_before():
+    try:
+        app.logger.info(">> %s %s from %s", request.method, request.path, request.remote_addr)
+    except Exception:
+        pass
+
+@app.after_request
+def _dbg_after(resp):
+    try:
+        app.logger.info("<< %s %s -> %s", request.method, request.path, resp.status_code)
+    except Exception:
+        pass
+    return resp
+
+@app.route('/ping')
+def ping():
+    return jsonify(ok=True, simulado=SIMULADO, ts=time.time())
+
+# ---------- Helpers de agrupamento ----------
+def _historico_window(secs: int):
+    cutoff = time.time() - secs
+    with _lock:
+        return [h for h in list(historico) if h['ts'] >= cutoff]
+
+def _eventos_window(secs: int):
+    cutoff = time.time() - secs
+    with _lock:
+        return [e for e in list(eventos) if e['ts'] >= cutoff]
+
+def _fmt_day(ts: float):
+    return datetime.fromtimestamp(ts).strftime('%Y-%m-%d')
+
+def _compute_stats_between(amostras, t0, t1):
+    vals = [a['umidade'] for a in amostras if t0 <= a['ts'] <= t1]
+    if not vals:
+        return None, None
+    return min(vals), sum(vals)/len(vals)
+
+def _build_timeline(secs: int):
+    samples = _historico_window(secs)
+    evts    = sorted(_eventos_window(secs), key=lambda e: e['ts'])
+
+    days_map = {}
+    total_volume = 0.0
+    total_pump_s = 0.0
+    total_sensor_on = 0
+    total_manual_on = 0
+    total_dry_s = 0.0
+
+    sess_open = None
+    on_events = [e for e in evts if e['tipo']=='pump' and str(e['valor']).startswith('on')]
+
+    def find_near_on(ts):
+        best = None
+        bestdt = 2.5
+        for e in on_events:
+            dt = abs(e['ts']-ts)
+            if dt < bestdt:
+                best = e
+                bestdt = dt
+        return best
+
+    prev_p = None
+    for a in samples:
+        p = a['pump']
+        if prev_p is None:
+            prev_p = p
+        if p and not prev_p:
+            sess_open = {
+                'start_ts': a['ts'],
+                'um_ini':   a['umidade'],
+                'cause':    'sensor' if a['modo']=='A' else 'manual',
+            }
+            near = find_near_on(a['ts'])
+            if near:
+                val = str(near['valor'])
+                if 'on/' in val:
+                    sess_open['cause'] = val.split('on/',1)[1]
+        if (not p) and prev_p and sess_open:
+            t0 = sess_open['start_ts']
+            t1 = a['ts']
+            dur = max(0.0, t1 - t0)
+            um_min, um_med = _compute_stats_between(samples, t0, t1)
+            flow = float(config.get('flow_lpm', 0.0))
+            vol = (flow * (dur/60.0)) if (config.get('flow_calibrated') and flow>0) else None
+
+            day = _fmt_day(t0)
+            if day not in days_map:
+                days_map[day] = {'sessions':[], 'dryness':[], 'counters':{
+                    'volume_l':0.0, 'pump_s':0.0, 'sensor_on':0, 'manual_on':0, 'dry_s':0.0
+                }}
+            sess = {
+                'start_ts': t0, 'end_ts': t1, 'dur_s': dur,
+                'cause': sess_open['cause'],
+                'volume_l': vol,
+                'um_ini': sess_open.get('um_ini'),
+                'um_min': um_min, 'um_med': um_med
+            }
+            days_map[day]['sessions'].append(sess)
+            days_map[day]['counters']['pump_s'] += dur
+            if vol:
+                days_map[day]['counters']['volume_l'] += vol
+                total_volume += vol
+            if sess['cause']=='sensor':
+                days_map[day]['counters']['sensor_on'] += 1
+                total_sensor_on += 1
+            else:
+                days_map[day]['counters']['manual_on'] += 1
+                total_manual_on += 1
+            total_pump_s += dur
+            sess_open = None
+        prev_p = p
+
+    dry_open = None
+    for a in samples:
+        if a['status']=='seco' and dry_open is None:
+            dry_open = a['ts']
+        if a['status']!='seco' and dry_open is not None:
+            t0 = dry_open
+            t1 = a['ts']
+            dur = max(0.0, t1-t0)
+            day = _fmt_day(t0)
+            if day not in days_map:
+                days_map[day] = {'sessions':[], 'dryness':[], 'counters':{
+                    'volume_l':0.0, 'pump_s':0.0, 'sensor_on':0, 'manual_on':0, 'dry_s':0.0
+                }}
+            days_map[day]['dryness'].append({'start_ts': t0, 'end_ts': t1, 'dur_s': dur})
+            days_map[day]['counters']['dry_s'] += dur
+            total_dry_s += dur
+            dry_open = None
+
+    if dry_open is not None and samples:
+        t0 = dry_open
+        t1 = samples[-1]['ts']
+        dur = max(0.0, t1-t0)
+        day = _fmt_day(t0)
+        if day not in days_map:
+            days_map[day] = {'sessions':[], 'dryness':[], 'counters':{
+                'volume_l':0.0, 'pump_s':0.0, 'sensor_on':0, 'manual_on':0, 'dry_s':0.0
+            }}
+        days_map[day]['dryness'].append({'start_ts': t0, 'end_ts': t1, 'dur_s': dur})
+        days_map[day]['counters']['dry_s'] += dur
+        total_dry_s += dur
+
+    days = []
+    for day, data in sorted(days_map.items(), key=lambda kv: kv[0], reverse=True):
+        data['sessions'].sort(key=lambda s: s['start_ts'], reverse=True)
+        data['dryness'].sort(key=lambda d: d['start_ts'], reverse=True)
+        days.append({'date': day, 'counters': data['counters'], 'sessions': data['sessions'], 'dryness': data['dryness']})
+
+    return {
+        'summary': {
+            'window_s': secs,
+            'volume_l': round(total_volume, 3),
+            'pump_s':   total_pump_s,
+            'sensor_on': total_sensor_on,
+            'manual_on': total_manual_on,
+            'dry_s':     total_dry_s
+        },
+        'days': days
+    }
+
+# ---------- HTML ----------
+HTML_PAGE = """<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AquaPulse</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css">
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<link rel="stylesheet" type="text/css" href="https://cdn.jsdelivr.net/npm/toastify-js/src/toastify.min.css">
+<link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+<style>
+:root {
+    --primary: #28a745;
+    --secondary: #264653;
+    --accent: #E9C46A;
+    --alert: #E76F51;
+    --background: #f0f4f8;
+    --text: #2B2D42;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; }
+body {
+    font-family: 'Poppins', sans-serif;
+    font-size: 16px;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    background: linear-gradient(180deg, #f9fafb, #eef2f6);
+}
+.app-wrap { min-height: 100vh; display:flex; align-items:center; justify-content:center; padding: 16px; }
+.phone-frame {
+    width: clamp(320px, 90vw, 420px);
+    min-height: 620px; background: #1a1a1a; border-radius: 25px; padding: 12px;
+    position: relative; box-shadow: 0 20px 50px rgba(0,0,0,0.35);
+    display:flex; flex-direction:column; overflow:hidden; margin:0 auto;
+}
+.phone-frame.wide { width:min(100%, 1000px); min-height:700px; background:transparent; border-radius:16px; padding: 0; box-shadow:none; }
+.phone-frame.wide .notch, .phone-frame.wide + .home-indicator { display:none; }
+.phone-frame.wide .screen-content { border-radius:16px; }
+.phone-frame.wide .tab-content-container { padding: 0 24px; }
+.screen-content { flex-grow:1; background:var(--background); border-radius:18px; display:flex; flex-direction:column; color:var(--text); position:relative; }
+.screen-header { padding: 6px 15px 0 15px; flex-shrink:0; position:relative; }
+.status-bar { font-size:0.7rem; font-weight:500; margin-bottom:8px; display:flex; justify-content:space-between; align-items:center; }
+.status-bar .bi { font-size:0.9em; }
+.screen-header h1 { font-size:0.8rem; margin:0 auto 8px auto; color:var(--secondary); font-weight:600; text-transform:uppercase; letter-spacing:0.5px; text-align:center; }
+.header-actions { position:absolute; right:10px; top:8px; display:flex; gap:8px; }
+.header-btn { border:none; background: rgba(0,0,0,0.06); color: var(--secondary); padding:6px 8px; border-radius:8px; cursor:pointer; font-weight:600; }
+.header-btn:hover { background: rgba(0,0,0,0.12); }
+.tab-content-container { flex-grow:1; position:relative; display:flex; flex-direction:column; padding: 0 15px; }
+.tab-pane { position:absolute; top:0; left:0; right:0; bottom:48px; opacity:0; visibility:hidden; transition:opacity .2s, visibility .2s; overflow:auto; padding-top:6px; }
+.tab-pane.active { opacity:1; visibility:visible; }
+.main-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:10px; }
+.metric-card { background:#fff; padding:10px; border-radius:15px; box-shadow:0 3px 8px rgba(0,0,0,0.07); text-align:center; }
+.metric-card h4 { font-size:0.7rem; color:var(--secondary); margin-bottom:6px; }
+.metric-card .value { font-size:0.9rem; color:var(--primary); font-weight:600; }
+.value-label { font-size:0.65rem; color:#6b7280; }
+.moisture-circle { width:65px; height:65px; margin:4px auto 6px; position:relative; }
+.moisture-progress { fill:none; stroke-width:6; transform:rotate(-90deg); transform-origin:50% 50%; transition:stroke-dashoffset .5s; }
+.flow-gauge { width:80px; height:36px; margin:4px auto 6px; position:relative; overflow:hidden; border:1px solid #e0e0e0; border-radius:6px; background:#e9ecef; }
+.flow-fill { position:absolute; bottom:0; left:0; width:100%; background:var(--primary); transition:height .5s; border-radius:5px 5px 0 0; }
+.flow-locked { opacity:.75; cursor:pointer; }
+.flow-unlocked { cursor:pointer; }
+.controls-grid { display:grid; grid-template-columns: repeat(3, 1fr); gap:8px; margin: 12px 0; }
+.control-btn { padding:8px 4px; border:none; border-radius:10px; background:var(--primary); color:#fff; display:flex; flex-direction:column; gap:4px; align-items:center; justify-content:center; font-size:.65rem; font-weight:600; min-height:55px; }
+.control-btn:hover { background:var(--secondary); transform:translateY(-2px); box-shadow:0 4px 8px rgba(0,0,0,0.1); }
+.control-btn:active { transform:scale(.96); }
+.segment { display:flex; background:#fff; border:1px solid #e5e7eb; border-radius:12px; overflow:hidden; }
+.segment button { flex:1; padding:8px 10px; background:transparent; border:none; font-weight:700; font-size:.75rem; color:#475569; cursor:pointer; }
+.segment button.active { background:rgba(40,167,69,.12); color:#0f5132; }
+.advanced-panel { background:#fff; border-radius:15px; padding:12px; box-shadow:0 3px 8px rgba(0,0,0,0.07); }
+.weather-alert { display:flex; align-items:center; gap:10px; margin-bottom:8px; font-size:.75rem; }
+.level-banner{ margin-top:10px; padding:10px 12px; border-radius:12px; font-weight:700; display:flex; align-items:center; justify-content:center; gap:8px; box-shadow:0 2px 8px rgba(0,0,0,0.08); }
+.level-seco{ background: linear-gradient(90deg,#ff5a5f,#d90429); color:#fff; }
+.level-medio{ background: linear-gradient(90deg,#f7d774,#f4a261); color:#2B2D42; }
+.level-umido{ background: linear-gradient(90deg,#2a9d8f,#28a745); color:#fff; }
+.tab-bar { display:flex; justify-content:space-around; padding:6px 0 8px; border-top:1px solid #ddd; background:#fff; box-shadow:0 -2px 5px rgba(0,0,0,0.05); position:absolute; bottom:0; left:0; width:100%; }
+.tab-btn { padding:6px 8px; border-radius:8px; color:#475569; opacity:.8; cursor:pointer; }
+.tab-btn.active { color:var(--primary); opacity:1; background:rgba(40,167,69,.08); }
+.notch { width:120px; height:22px; background:#1a1a1a; border-radius:0 0 15px 15px; position:absolute; top:0; left:50%; transform:translateX(-50%); }
+.home-indicator { width:90px; height:3.5px; background:rgba(0,0,0,0.2); border-radius:2px; position:absolute; bottom:8px; left:50%; transform:translateX(-50%); }
+.hist-controls { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin:8px 0; }
+.kpi-row { display:grid; grid-template-columns: repeat(2, 1fr); gap:8px; margin: 8px 0 10px; }
+.kpi { background:#fff; border-radius:12px; padding:10px; box-shadow:0 2px 6px rgba(0,0,0,0.06); }
+.kpi .kpi-title { font-size:.7rem; color:#6b7280; }
+.kpi .kpi-value { font-size:.95rem; font-weight:700; color:#0f172a; }
+.day-block { margin:10px 0; }
+.day-title { font-size:.8rem; font-weight:800; color:#0f172a; margin-bottom:6px; }
+.timeline { display:flex; flex-direction:column; gap:8px; }
+.timeline-item { background:#fff; border-left:4px solid var(--primary); border-radius:8px; padding:8px 10px; box-shadow:0 2px 6px rgba(0,0,0,0.06); }
+.badge { display:inline-flex; align-items:center; gap:6px; background:#eef6ee; color:#166534; border:1px solid #bbf7d0; border-radius:999px; padding:4px 8px; font-size:.7rem; font-weight:700; }
+.badge.manual { background:#fff7ed; color:#9a3412; border-color:#fed7aa; }
+.badge.sensor { background:#ecfeff; color:#155e75; border-color:#a5f3fc; }
+.small { font-size:.7rem; color:#475569; }
+.divider { height:1px; background:#e5e7eb; margin:8px 0; }
+.table-compact { width:100%; border-collapse:collapse; background:#fff; border-radius:12px; overflow:hidden; box-shadow:0 3px 8px rgba(0,0,0,0.07); display:none; }
+.table-compact.show { display:table; }
+.table-compact th, .table-compact td { padding:8px 10px; border-bottom:1px solid #eee; font-size:.75rem; text-align:left; }
+.table-compact th { background:#f8fafc; color:#475569; }
+.modal-overlay { position:fixed; inset:0; background:rgba(0,0,0,0.45); display:none; align-items:center; justify-content:center; z-index:999; }
+.modal-overlay.active { display:flex; }
+.modal-card { width:min(92vw, 520px); background:#fff; border-radius:12px; padding:16px; box-shadow:0 10px 30px rgba(0,0,0,0.25); }
+.modal-card h3 { margin-bottom:8px; color:var(--secondary); font-size:1rem; }
+.stopwatch { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+.stopwatch-display { font-variant-numeric: tabular-nums; min-width:104px; padding:6px 8px; border-radius:8px; border:1px solid #e5e7eb; background:#f8fafc; text-align:center; }
+.stopwatch button { border:none; padding:6px 8px; border-radius:8px; cursor:pointer; background:#e5e7eb; }
+</style>
+</head>
+<body>
+<div class="app-wrap">
+  <div class="phone-frame" id="phoneFrame">
+    <div class="notch"></div>
+    <div class="screen-content">
+      <div class="screen-header">
+        <div class="status-bar">
+          <span id="currentTime">--:--</span>
+          <div><i class="bi bi-wifi"></i> <i class="bi bi-battery-half" style="margin-left:5px;"></i></div>
+        </div>
+        <h1>AquaPulse</h1>
+        <div class="header-actions">
+          <button class="header-btn" id="layoutToggle" title="Alternar layout (compacto/amplo)"><i class="bi bi-aspect-ratio"></i></button>
+        </div>
+      </div>
+
+      <div class="tab-content-container">
+        <!-- ===== Principal ===== -->
+        <div class="tab-pane active" id="mainTab">
+          <div class="main-grid">
+            <!-- Umidade -->
+            <div class="metric-card">
+              <h4>Umidade Alvo <span class="value" id="moistureTarget" style="margin-left:6px;">65%</span></h4>
+              <input type="range" min="0" max="100" id="moistureSlider">
+              <div class="moisture-circle">
+                <svg viewBox="0 0 65 65"><circle cx="32.5" cy="32.5" r="29.5" stroke="#eee" stroke-width="6"/><circle class="moisture-progress" id="moistureCircleProgress" cx="32.5" cy="32.5" r="29.5" stroke="var(--primary)" stroke-width="6" stroke-dasharray="185" stroke-linecap="round"/></svg>
+                <div style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);text-align:center;">
+                  <div class="value" id="currentMoistureValue">--%</div>
+                  <div class="value-label">Atual</div>
+                </div>
+              </div>
+            </div>
+
+            <!-- Vazão / Volume (visual) -->
+            <div class="metric-card" id="flowCard">
+              <h4 style="display:flex;gap:6px;align-items:center;justify-content:center;">Vazão <span id="flowBadge" class="badge"><i class="bi bi-lock-fill"></i> Bloqueado</span></h4>
+              <div class="flow-gauge"><div class="flow-fill" id="flowFillGauge" style="height:0%"></div></div>
+              <div class="value" id="currentFlowValue">0.00 L/min</div>
+              <div class="value-label">Sessão: <span id="sessionVolume">0.000 L</span></div>
+            </div>
+          </div>
+
+          <!-- Controles -->
+          <div class="controls-grid">
+            <button class="control-btn" id="powerBtn"><i class="bi bi-power"></i> LIGAR</button>
+
+            <!-- Segmento do modo -->
+            <div class="segment" style="grid-column: span 2;">
+              <button id="modeManual" data-m="M">Manual</button>
+              <button id="modeSensor" data-m="A">Sensor</button>
+            </div>
+          </div>
+
+          <div class="advanced-panel">
+            <div class="weather-alert">
+              <i class="bi bi-cloud-sun" id="weatherIcon"></i>
+              <div>
+                <div id="weatherTemp">Previsão: --°C</div>
+                <div id="weatherRain">Chuva: --%</div>
+              </div>
+            </div>
+            <div class="small" style="display:flex;gap:10px;flex-wrap:wrap;">
+              <span id="connectionStatus"><i class="bi bi-plug"></i>Desconectado</span>
+              <span id="uiAguaHoje"><i class="bi bi-droplet"></i>Hoje: 0.000 L</span>
+              <span id="uiModo"><i class="bi bi-gear"></i>Modo: Manual</span>
+              <span id="uiUmid"><i class="bi bi-droplet"></i>Umidade: --%</span>
+              <span id="uiNivel"><i class="bi bi-activity"></i>Nível: --</span>
+            </div>
+            <div class="level-banner" id="levelBanner"><i class="bi bi-activity"></i> Nível: --</div>
+          </div>
+        </div>
+
+        <!-- ===== Gráfico ===== -->
+        <div class="tab-pane" id="graphTab">
+          <div style="display:flex;gap:8px;align-items:center;margin:6px 0 10px;">
+            <span class="small">Janela:</span>
+            <button class="header-btn" onclick="setChartWindow(900)">15 min</button>
+            <button class="header-btn" onclick="setChartWindow(3600)">1 h</button>
+            <button class="header-btn" onclick="setChartWindow(21600)">6 h</button>
+            <button class="header-btn" onclick="setChartWindow(86400)">24 h</button>
+            <a class="header-btn" id="csvLink" href="/historico.csv?secs=3600" download>Exportar CSV</a>
+          </div>
+          <canvas id="umidChart" height="220"></canvas>
+        </div>
+
+        <!-- ===== Histórico ===== -->
+        <div class="tab-pane" id="historyTab">
+          <div class="hist-controls">
+            <span class="small">Período:</span>
+            <button class="header-btn" onclick="loadTimeline(21600)">6 h</button>
+            <button class="header-btn" onclick="loadTimeline(86400)">24 h</button>
+            <button class="header-btn" onclick="loadTimeline(604800)">7 d</button>
+            <button class="header-btn" onclick="toggleRaw()">Mostrar/ocultar logs brutos</button>
+          </div>
+
+          <!-- KPIs -->
+          <div class="kpi-row" id="kpiRow">
+            <div class="kpi"><div class="kpi-title">Água no período</div><div class="kpi-value" id="kpiAgua">0.000 L</div></div>
+            <div class="kpi"><div class="kpi-title">Tempo ligado</div><div class="kpi-value" id="kpiTempo">00:00:00</div></div>
+            <div class="kpi"><div class="kpi-title">Inícios: Sensor</div><div class="kpi-value" id="kpiSensor">0</div></div>
+            <div class="kpi"><div class="kpi-title">Inícios: Manual</div><div class="kpi-value" id="kpiManual">0</div></div>
+          </div>
+
+          <div id="daysContainer"></div>
+
+          <div class="divider"></div>
+          <table class="table-compact" id="histTable">
+            <thead><tr><th>Hora</th><th>Umidade</th><th>Nível</th><th>Bomba</th><th>Modo</th></tr></thead>
+            <tbody></tbody>
+          </table>
+
+          <h4 style="margin:10px 0 6px; font-size:.85rem; color:#0f172a;">Eventos</h4>
+          <table class="table-compact" id="evtTable">
+            <thead><tr><th>Hora</th><th>Tipo</th><th>Detalhe</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+
+        <!-- ===== Config ===== -->
+        <div class="tab-pane" id="settingsTab">
+          <div class="metric-card" style="text-align:left;">
+            <h4 style="margin-bottom:8px;">Preferências</h4>
+            <label class="small">Umidade alvo (<span id="cfgUmidAlvoLbl">--%</span>)</label>
+            <input type="range" min="0" max="100" id="cfgUmidAlvo">
+            <label class="small" style="margin-top:8px;">Intervalo de atualização (<span id="cfgRefreshLbl">-- ms</span>)</label>
+            <input type="range" min="500" max="5000" step="100" id="cfgRefresh">
+            <div style="margin-top:10px; display:flex; gap:8px; flex-wrap:wrap;">
+              <button class="control-btn" id="saveCfgBtn" style="flex:1;"><i class="bi bi-save2"></i> SALVAR</button>
+              <button class="control-btn" id="reloadCfgBtn" style="flex:1; background:var(--secondary);"><i class="bi bi-arrow-repeat"></i> RECARREGAR</button>
+              <button class="control-btn" id="resetTodayBtn" style="flex:1; background:#dc2626;"><i class="bi bi-trash3"></i> ZERAR HOJE</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="tab-bar">
+        <div class="tab-btn active" data-tab="mainTab" onclick="showTab('mainTab', this)"><i class="bi bi-house-door-fill"></i></div>
+        <div class="tab-btn" data-tab="graphTab" onclick="showTab('graphTab', this)"><i class="bi bi-graph-up"></i></div>
+        <div class="tab-btn" data-tab="historyTab" onclick="showTab('historyTab', this)"><i class="bi bi-clock-history"></i></div>
+        <div class="tab-btn" data-tab="settingsTab" onclick="showTab('settingsTab', this)"><i class="bi bi-gear"></i></div>
+      </div>
+    </div>
+    <div class="home-indicator"></div>
+  </div>
+</div>
+
+<!-- Logs JS úteis -->
+<script>
+(function(){
+  window.addEventListener('error', function(e){
+    try { console.error('JS error:', e.message, 'em', e.filename+':'+e.lineno); } catch(_){}
+  });
+  window.addEventListener('unhandledrejection', function(e){
+    try { console.error('Promise rejection:', e.reason); } catch(_){}
+  });
+  var _origFetch = window.fetch;
+  if (_origFetch) {
+    window.fetch = function(url, options){
+      var method = (options && options.method) ? options.method : 'GET';
+      try { console.log('[fetch]', method, url); } catch(_){}
+      return _origFetch(url, options).then(function(resp){
+        try { console.log('[fetch resp]', resp.status, url); } catch(_){}
+        return resp;
+      }).catch(function(err){
+        try { console.error('[fetch err]', url, err); } catch(_){}
+        throw err;
+      });
+    };
+  }
+})();
+</script>
+
+<script src="https://cdn.jsdelivr.net/npm/toastify-js"></script>
+<script>
+/* ===== Utils ===== */
+var MOISTURE_CIRCUMFERENCE = 185;
+var REFRESH_MS = 1000;
+var statusTimer = null;
+
+function traduzStatus(st){
+  if(st==='seco') return 'Solo Seco';
+  if(st==='medio') return 'Solo Médio';
+  if(st==='umido') return 'Solo Úmido';
+  return st || '--';
+}
+function setCircle(percent){
+  var circle=document.getElementById('moistureCircleProgress');
+  var text=document.getElementById('currentMoistureValue');
+  var p=Math.max(0,Math.min(100,percent||0));
+  var offset=MOISTURE_CIRCUMFERENCE*(1-(p/100));
+  if(circle) circle.style.strokeDashoffset=offset;
+  if(text) text.textContent=p.toFixed(1)+'%';
+}
+function setLevelStrip(st){
+  var el=document.getElementById('levelBanner'); if(!el)return;
+  el.classList.remove('level-seco','level-medio','level-umido');
+  if(st==='seco'){ el.classList.add('level-seco'); el.innerHTML='<i class="bi bi-activity"></i> Solo Seco'; }
+  else if(st==='medio'){ el.classList.add('level-medio'); el.innerHTML='<i class="bi bi-activity"></i> Solo Médio'; }
+  else if(st==='umido'){ el.classList.add('level-umido'); el.innerHTML='<i class="bi bi-activity"></i> Solo Úmido'; }
+  else { el.innerHTML='<i class="bi bi-activity"></i> Nível: --'; }
+}
+function updateClock(){
+  var now=new Date();
+  var hh=String(now.getHours()).padStart(2,'0');
+  var mm=String(now.getMinutes()).padStart(2,'0');
+  var el=document.getElementById('currentTime');
+  if(el) el.textContent=hh+':'+mm;
+}
+function refreshWeather(){
+  var t=20+Math.floor(Math.random()*12);
+  var r=Math.floor(Math.random()*80);
+  document.getElementById('weatherTemp').textContent='Previsão: '+t+'°C';
+  document.getElementById('weatherRain').textContent='Chuva: '+r+'%';
+}
+function hhmmss(s){
+  s=Math.floor(s);
+  var h=String(Math.floor(s/3600)).padStart(2,'0');
+  var m=String(Math.floor((s%3600)/60)).padStart(2,'0');
+  var sec=String(s%60).padStart(2,'0');
+  return h+':'+m+':'+sec;
+}
+
+/* ===== Backend ===== */
+var modoAtual='M', pumpAtiva=false, flowUnlocked=false, flowLpm=0.0, flowGaugeMax=15.0;
+function setModo(m){ fetch('/modo/'+m).then(function(){ atualizarStatus(); }); }
+function toggleSystem(){
+  var btn=document.getElementById('powerBtn');
+  if(modoAtual==='A'){ if(btn){ btn.disabled=true; btn.style.opacity='0.6'; } return; }
+  fetch(pumpAtiva?'/bomba/off':'/bomba/on').then(function(){ atualizarStatus(); });
+}
+function scheduleStatus(){
+  if(statusTimer) clearInterval(statusTimer);
+  statusTimer = setInterval(atualizarStatus, REFRESH_MS);
+}
+function atualizarStatus(){
+  fetch('/status').then(function(r){ return r.json(); }).then(function(s){
+    // UI topo
+    modoAtual=s.modo||'M'; pumpAtiva=!!s.pump;
+    document.getElementById('uiModo').innerHTML='<i class="bi bi-gear"></i>Modo: '+(modoAtual==='A'?'Sensor':'Manual');
+    document.getElementById('uiUmid').innerHTML='<i class="bi bi-droplet"></i>Umidade: '+(s.umidade!==undefined?s.umidade.toFixed(1)+'%':'--%');
+    document.getElementById('uiNivel').innerHTML='<i class="bi bi-activity"></i>Nível: '+traduzStatus(s.status);
+    setCircle(s.umidade||0); setLevelStrip(s.status);
+    var conn = s.simulado ? ('Simulado'+(s.sim_err?' ('+s.sim_err+')':'')) : 'Conectado ('+(s.serial_port||'')+')';
+    document.getElementById('connectionStatus').innerHTML='<i class="bi bi-plug-fill"></i>'+conn;
+    document.getElementById('uiAguaHoje').innerHTML='<i class="bi bi-droplet"></i>Hoje: '+(s.volume_today_l||0).toFixed(3)+' L';
+
+    // Vazão / Volume
+    flowUnlocked=!!s.flow_unlocked; flowLpm=Number(s.flow_lpm||0); flowGaugeMax=Number(s.flow_gauge_max||15);
+    var instFlow=pumpAtiva?flowLpm:0.0;
+    document.getElementById('currentFlowValue').textContent=instFlow.toFixed(2)+' L/min';
+    document.getElementById('sessionVolume').textContent=(s.volume_session_l||0).toFixed(3)+' L';
+    document.getElementById('flowFillGauge').style.height=(Math.max(0,Math.min(1,instFlow/Math.max(0.001,flowGaugeMax)))*100)+'%';
+    var badge=document.getElementById('flowBadge'), card=document.getElementById('flowCard');
+    if(flowUnlocked){ badge.className='badge'; badge.innerHTML='<i class="bi bi-unlock"></i> Calibrado'; card.classList.add('flow-unlocked'); card.classList.remove('flow-locked'); }
+    else{ badge.className='badge'; badge.innerHTML='<i class="bi bi-lock-fill"></i> Bloqueado'; card.classList.add('flow-locked'); card.classList.remove('flow-unlocked'); }
+
+    // Botão power
+    var btn=document.getElementById('powerBtn');
+    if(modoAtual==='A'){ btn.disabled=true; btn.style.opacity='0.6'; btn.innerHTML='<i class="bi bi-power"></i> (Auto)'; btn.style.background='var(--secondary)'; }
+    else{ btn.disabled=false; btn.style.opacity='1'; btn.innerHTML='<i class="bi bi-power"></i> '+(pumpAtiva?'DESLIGAR':'LIGAR'); btn.style.background=pumpAtiva?'var(--alert)':'var(--primary)'; }
+
+    // Segmento modo
+    var segBtns=document.querySelectorAll('.segment button');
+    var i; for(i=0;i<segBtns.length;i++){ segBtns[i].classList.remove('active'); }
+    if(modoAtual==='A') document.getElementById('modeSensor').classList.add('active');
+    else document.getElementById('modeManual').classList.add('active');
+  });
+}
+
+/* ===== Chart (sem adapter de datas) ===== */
+var umidChart=null, chartWinSecs=3600;
+function ensureChart(){
+  if(umidChart) return;
+  var ctx=document.getElementById('umidChart').getContext('2d');
+  umidChart=new Chart(ctx,{ type:'line',
+    data:{ labels:[], datasets:[{label:'Umidade (%)',data:[],tension:.25,fill:false,borderWidth:2,pointRadius:0}]},
+    options:{ responsive:true, maintainAspectRatio:false, interaction:{mode:'nearest',intersect:false},
+      scales:{ x:{ ticks:{autoSkip:true,maxTicksLimit:8}}, y:{beginAtZero:true,suggestedMax:100,ticks:{stepSize:10}}}
+    }
+  });
+  carregarHistoricoGrafico();
+}
+function setChartWindow(secs){ chartWinSecs=secs; document.getElementById('csvLink').href='/historico.csv?secs='+secs; carregarHistoricoGrafico(); }
+function carregarHistoricoGrafico(){
+  fetch('/historico?secs='+chartWinSecs).then(function(r){ return r.json(); }).then(function(arr){
+    if(!umidChart) return;
+    var labels=[], data=[];
+    for(var i=0;i<arr.length;i++){
+      labels.push(new Date(arr[i].ts*1000).toLocaleTimeString());
+      data.push(arr[i].umidade);
+    }
+    umidChart.data.labels = labels;
+    umidChart.data.datasets[0].data = data;
+    umidChart.update('none');
+  });
+}
+
+/* ===== Histórico ===== */
+var timelineSecs=86400;
+function toggleRaw(){
+  document.getElementById('histTable').classList.toggle('show');
+  document.getElementById('evtTable').classList.toggle('show');
+}
+function loadTimeline(secs){
+  timelineSecs=secs;
+  fetch('/timeline?secs='+secs).then(function(r){ return r.json(); }).then(function(data){
+    document.getElementById('kpiAgua').textContent=(data.summary.volume_l||0).toFixed(3)+' L';
+    document.getElementById('kpiTempo').textContent=hhmmss(data.summary.pump_s||0);
+    document.getElementById('kpiSensor').textContent=Number(data.summary.sensor_on||0);
+    document.getElementById('kpiManual').textContent=Number(data.summary.manual_on||0);
+
+    var cont=document.getElementById('daysContainer'); cont.innerHTML='';
+    var days=data.days||[];
+    for(var dI=0; dI<days.length; dI++){
+      var d=days[dI];
+      var wrap=document.createElement('div'); wrap.className='day-block';
+      var title=document.createElement('div'); title.className='day-title'; title.textContent=d.date;
+      wrap.appendChild(title);
+
+      var t1=document.createElement('div'); t1.className='timeline';
+      var sessions=d.sessions||[];
+      for(var sI=0; sI<sessions.length; sI++){
+        var s=sessions[sI];
+        var item=document.createElement('div'); item.className='timeline-item';
+        var causeIcon = (s.cause==='sensor')?'bi-cpu':'bi-hand-index-thumb';
+        var causeTxt  = (s.cause==='sensor')?'Sensor':'Manual';
+        var causeBadge = '<span class="badge '+(s.cause==='sensor'?'sensor':'manual')+'"><i class="bi '+causeIcon+'"></i> '+causeTxt+'</span>';
+        var vol = (s.volume_l==null)?'—':(Number(s.volume_l).toFixed(3)+' L');
+        var endTxt = s.end_ts ? new Date(s.end_ts*1000).toLocaleTimeString() : '—';
+
+        var um_ini_txt = (typeof s.um_ini === 'number') ? s.um_ini.toFixed(1) : '--';
+        var um_min_txt = (typeof s.um_min === 'number') ? s.um_min.toFixed(1) : '--';
+        var um_med_txt = (typeof s.um_med === 'number') ? s.um_med.toFixed(1) : '--';
+
+        item.innerHTML =
+          '<div><b>'+new Date(s.start_ts*1000).toLocaleTimeString()+'</b> → <b>'+ endTxt +'</b> '+ causeBadge +'</div>' +
+          '<div class="small">Duração: '+ hhmmss(s.dur_s) +
+          ' · Volume: '+ vol +
+          ' · Umidade: ini '+ um_ini_txt +
+          '% · mín '+ um_min_txt +
+          '% · média '+ um_med_txt + '%</div>';
+        t1.appendChild(item);
+      }
+      if(sessions.length){ wrap.appendChild(t1); }
+
+      var dryness=d.dryness||[];
+      if(dryness.length){
+        var sep=document.createElement('div'); sep.className='divider'; wrap.appendChild(sep);
+        var t2=document.createElement('div'); t2.className='timeline';
+        for(var xI=0;xI<dryness.length;xI++){
+          var x=dryness[xI];
+          var item2=document.createElement('div'); item2.className='timeline-item'; item2.style.borderLeftColor='#d90429';
+          item2.innerHTML='<div><span class="badge" style="background:#fee2e2;color:#991b1b;border-color:#fecaca;"><i class="bi bi-thermometer-snow"></i> Solo Seco</span> '
+                         +'<b>'+new Date(x.start_ts*1000).toLocaleTimeString()+'</b> → <b>'+new Date(x.end_ts*1000).toLocaleTimeString()+'</b></div>'
+                         +'<div class="small">Duração: '+hhmmss(x.dur_s)+'</div>';
+          t2.appendChild(item2);
+        }
+        wrap.appendChild(t2);
+      }
+
+      var c=d.counters||{};
+      var kpis=document.createElement('div'); kpis.className='kpi-row';
+      kpis.innerHTML='<div class="kpi"><div class="kpi-title">Água (dia)</div><div class="kpi-value">'+(c.volume_l||0).toFixed(3)+' L</div></div>'
+                    +'<div class="kpi"><div class="kpi-title">Tempo ligado</div><div class="kpi-value">'+hhmmss(c.pump_s||0)+'</div></div>'
+                    +'<div class="kpi"><div class="kpi-title">Inícios Sensor</div><div class="kpi-value">'+(c.sensor_on||0)+'</div></div>'
+                    +'<div class="kpi"><div class="kpi-title">Tempo solo seco</div><div class="kpi-value">'+hhmmss(c.dry_s||0)+'</div></div>';
+      wrap.appendChild(kpis);
+
+      cont.appendChild(wrap);
+    }
+
+    carregarHistoricoTabela(); carregarEventosTabela();
+  });
+}
+
+/* Logs brutos */
+function carregarHistoricoTabela(){
+  fetch('/historico?secs='+timelineSecs).then(function(r){ return r.json(); }).then(function(arr){
+    var tb=document.querySelector('#histTable tbody'); tb.innerHTML='';
+    var ult = arr.slice(-200).reverse();
+    for(var i=0;i<ult.length;i++){
+      var d=ult[i]; var tr=document.createElement('tr'); var dt=new Date(d.ts*1000);
+      tr.innerHTML='<td>'+dt.toLocaleTimeString()+'</td><td>'+d.umidade.toFixed(1)+'%</td><td>'+traduzStatus(d.status)+'</td><td>'+(d.pump?'Ligada':'Desligada')+'</td><td>'+(d.modo==='A'?'Sensor':'Manual')+'</td>';
+      tb.appendChild(tr);
+    }
+  });
+}
+function carregarEventosTabela(){
+  fetch('/eventos?limit=300').then(function(r){ return r.json(); }).then(function(arr){
+    var tb=document.querySelector('#evtTable tbody'); tb.innerHTML='';
+    for(var i=0;i<arr.length;i++){
+      var ev=arr[i]; var tr=document.createElement('tr'); var dt=new Date(ev.ts*1000);
+      var det = ev.valor;
+      if(ev.tipo==='pump'){
+        var parts=String(ev.valor).split('/');
+        var a=parts[0]||''; var b=parts[1]||'';
+        det = (a==='on'?'Ligou':'Desligou')+' ('+(b||'—')+')';
+      }else if(ev.tipo==='status'){
+        det = 'Status: '+ev.valor;
+      }else if(ev.tipo==='modo'){
+        det = 'Modo: '+(ev.valor==='A'?'Sensor':'Manual');
+      }
+      tr.innerHTML='<td>'+dt.toLocaleString()+'</td><td>'+ev.tipo+'</td><td>'+det+'</td>';
+      tb.appendChild(tr);
+    }
+  });
+}
+
+/* ===== Config ===== */
+function carregarConfig(){
+  fetch('/config').then(function(r){ return r.json(); }).then(function(cfg){
+    REFRESH_MS = cfg.refresh_ms || 1000;
+    document.getElementById('moistureSlider').value = (cfg.umidade_alvo !== undefined ? cfg.umidade_alvo : 65);
+    document.getElementById('moistureTarget').textContent = (cfg.umidade_alvo !== undefined ? cfg.umidade_alvo : 65)+'%';
+    document.getElementById('cfgUmidAlvo').value   = (cfg.umidade_alvo !== undefined ? cfg.umidade_alvo : 65);
+    document.getElementById('cfgRefresh').value    = (cfg.refresh_ms !== undefined ? cfg.refresh_ms : 1000);
+    document.getElementById('cfgUmidAlvoLbl').textContent = (cfg.umidade_alvo !== undefined ? cfg.umidade_alvo : 65)+'%';
+    document.getElementById('cfgRefreshLbl').textContent  = (cfg.refresh_ms !== undefined ? cfg.refresh_ms : 1000)+' ms';
+    scheduleStatus();
+  });
+}
+function salvarConfig(payload){
+  fetch('/config', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)})
+  .then(function(r){ return r.json(); }).then(function(){
+    Toastify({text:"Configurações salvas", duration:1600, gravity:"bottom", position:"center", backgroundColor:"#28a745"}).showToast();
+    carregarConfig();
+  });
+}
+
+/* ===== Layout + Tabs ===== */
+function showTab(tabId, clicked){
+  var panes=document.querySelectorAll('.tab-pane'); var i;
+  for(i=0;i<panes.length;i++){ panes[i].classList.remove('active'); }
+  var pane=document.getElementById(tabId);
+  if(pane){ pane.classList.add('active'); }
+  var tabs=document.querySelectorAll('.tab-btn'); var j;
+  for(j=0;j<tabs.length;j++){ tabs[j].classList.remove('active'); }
+  if(clicked) clicked.classList.add('active');
+  if(tabId==='graphTab') ensureChart();
+  if(tabId==='historyTab'){ loadTimeline(86400); }
+}
+function toggleLayout(){
+  var frame=document.getElementById('phoneFrame'); frame.classList.toggle('wide');
+  try{ localStorage.setItem('layoutWide', frame.classList.contains('wide')?'1':'0'); }catch(_){}
+}
+
+/* ===== Calibração ===== */
+function openFlowModal(){ document.getElementById('flowModal').classList.add('active'); }
+function closeFlowModal(){ document.getElementById('flowModal').classList.remove('active'); }
+function saveCalibration(){
+  var secs=parseFloat(document.getElementById('calibSeconds').value);
+  if(!secs||secs<=0){ Toastify({text:"Informe o tempo (s) válido", duration:2000, backgroundColor:"#ef4444"}).showToast(); return; }
+  fetch('/flow/calibrate',{method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({seconds:secs})})
+  .then(function(r){ return r.json(); }).then(function(res){
+    if(res.ok){ Toastify({text:"Calibrado: "+res.flow_lpm.toFixed(2)+" L/min", duration:2000, backgroundColor:"#16a34a"}).showToast(); closeFlowModal(); atualizarStatus(); }
+  });
+}
+
+/* Cronômetro */
+var swRunning=false, swStartTs=0, swElapsed=0, swTimer=null;
+function swUpdate(){
+  var t=swRunning?(performance.now()-swStartTs)+swElapsed:swElapsed;
+  var ms=Math.floor(t%1000/100); var s=Math.floor(t/1000)%60; var m=Math.floor(t/60000);
+  document.getElementById('swDisplay').textContent=String(m).padStart(2,'0')+':'+String(s).padStart(2,'0')+'.'+ms;
+}
+function swStart(){ if(swRunning)return; swRunning=true; swStartTs=performance.now(); document.getElementById('swStart').disabled=true; document.getElementById('swStop').disabled=false; document.getElementById('swReset').disabled=true; swTimer=setInterval(swUpdate,100); }
+function swStop(){ if(!swRunning)return; swRunning=false; swElapsed+=performance.now()-swStartTs; clearInterval(swTimer); swTimer=null; document.getElementById('swStart').disabled=false; document.getElementById('swStop').disabled=true; document.getElementById('swReset').disabled=false; swUpdate(); }
+function swReset(){ swRunning=false; swElapsed=0; clearInterval(swTimer); swTimer=null; swUpdate(); document.getElementById('swStart').disabled=false; document.getElementById('swStop').disabled=true; document.getElementById('swReset').disabled=true; }
+function swUse(){ var secs=(swElapsed/1000); if(secs<=0){ Toastify({text:"Cronômetro em 0", duration:1600, backgroundColor:"#ef4444"}).showToast(); return; } document.getElementById('calibSeconds').value=secs.toFixed(1); var lpm=60/Math.max(0.001,secs); var badge=document.getElementById('calculatedFlowBadge'); badge.style.display='inline-flex'; badge.innerHTML='<i class="bi bi-lightning-charge"></i> ~'+lpm.toFixed(2)+' L/min'; }
+
+/* ===== Boot robusto ===== */
+function boot(){
+  try{ console.log('AquaPulse: JS boot'); }catch(_){}
+  updateClock(); setInterval(updateClock,1000);
+  refreshWeather(); var wi=document.getElementById('weatherIcon'); if(wi) wi.addEventListener('click', refreshWeather);
+
+  try{ var savedLayout = localStorage.getItem('layoutWide'); if(savedLayout==='1') document.getElementById('phoneFrame').classList.add('wide'); }catch(_){}
+  var lo=document.getElementById('layoutToggle'); if(lo) lo.addEventListener('click', toggleLayout);
+
+  carregarConfig(); atualizarStatus(); scheduleStatus();
+
+  var ms=document.getElementById('moistureSlider');
+  if(ms){ ms.addEventListener('input', function(e){ var v=Number(e.target.value); document.getElementById('moistureTarget').textContent=v+'%'; salvarConfig({umidade_alvo:v}); }); }
+
+  var mm=document.getElementById('modeManual'); if(mm){ mm.addEventListener('click', function(){ setModo('M'); }); }
+  var msr=document.getElementById('modeSensor'); if(msr){ msr.addEventListener('click', function(){ setModo('A'); }); }
+
+  var pb=document.getElementById('powerBtn'); if(pb){ pb.addEventListener('click', toggleSystem); }
+  var fc=document.getElementById('flowCard'); if(fc){ fc.addEventListener('click', openFlowModal); }
+
+  var c1=document.getElementById('cfgUmidAlvo'); if(c1){ c1.addEventListener('input', function(e){ document.getElementById('cfgUmidAlvoLbl').textContent=e.target.value+'%'; }); }
+  var c2=document.getElementById('cfgRefresh'); if(c2){ c2.addEventListener('input', function(e){ document.getElementById('cfgRefreshLbl').textContent=e.target.value+' ms'; }); }
+  var bsave=document.getElementById('saveCfgBtn'); if(bsave){ bsave.addEventListener('click', function(){ salvarConfig({ umidade_alvo:Number(document.getElementById('cfgUmidAlvo').value), refresh_ms:Number(document.getElementById('cfgRefresh').value) }); }); }
+  var brel=document.getElementById('reloadCfgBtn'); if(brel){ brel.addEventListener('click', carregarConfig); }
+  var bzero=document.getElementById('resetTodayBtn'); if(bzero){ bzero.addEventListener('click', function(){ fetch('/flow/reset_today',{method:'POST'}).then(function(){ Toastify({text:"Total de hoje zerado", duration:1600, backgroundColor:"#0ea5e9"}).showToast(); atualizarStatus(); }); }); }
+
+  setInterval(function(){ var gt=document.getElementById('graphTab'); if(gt && gt.classList.contains('active')) carregarHistoricoGrafico(); }, 3000);
+}
+if(document.readyState === 'loading'){ document.addEventListener('DOMContentLoaded', boot); } else { boot(); }
+</script>
+
+<!-- Modal Calibração -->
+<div class="modal-overlay" id="flowModal">
+  <div class="modal-card">
+    <h3>Desbloquear Vazão (Tutorial)</h3>
+    <p class="small">Use uma garrafa de <b>1 L</b> e cronometre o tempo para encher. Depois informe abaixo.</p>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:6px 0;">
+      <label class="small">Tempo para 1 L (s):</label>
+      <input type="number" id="calibSeconds" min="1" step="0.1" placeholder="ex.: 25.5" style="padding:6px;border:1px solid #e5e7eb;border-radius:8px;width:120px;">
+      <span id="calculatedFlowBadge" class="badge" style="display:none;"></span>
+    </div>
+    <div class="stopwatch" style="margin:8px 0;">
+      <div class="stopwatch-display" id="swDisplay">00:00.0</div>
+      <button id="swStart">Iniciar</button>
+      <button id="swStop" disabled>Parar</button>
+      <button id="swReset" disabled>Reset</button>
+      <button id="swUse">Usar tempo</button>
+    </div>
+    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:8px;">
+      <button class="header-btn" onclick="closeFlowModal()">Fechar</button>
+      <button class="header-btn" style="background:#16a34a;color:#fff;" onclick="saveCalibration()">Salvar calibração</button>
+    </div>
+  </div>
+</div>
+</body>
+</html>
+"""
+
+# ---------- Rotas ----------
+@app.route('/')
+def index():
+    return render_template_string(HTML_PAGE)
+
+@app.route('/bomba/on')
+def liga():
+    estado['pump'] = True
+    now = time.time()
+    _handle_pump_transition(now, True, cause='manual')
+    if ser:
+        try: ser.write(b'1\n'); ser.flush()
+        except Exception as e: app.logger.info("Erro write ON: %r", e)
+    return jsonify(status='Bomba LIGADA')
+
+@app.route('/bomba/off')
+def desliga():
+    estado['pump'] = False
+    now = time.time()
+    _handle_pump_transition(now, False, cause='manual')
+    if ser:
+        try: ser.write(b'0\n'); ser.flush()
+        except Exception as e: app.logger.info("Erro write OFF: %r", e)
+    return jsonify(status='Bomba DESLIGADA')
+
+@app.route('/modo/<m>')
+def set_modo(m):
+    if m in ('M','A'):
+        if ser:
+            try: ser.write(m.encode()); ser.flush()
+            except Exception as e: app.logger.info("Erro write modo: %r", e)
+        if estado.get('modo') != m:
+            _registrar_evento(time.time(), 'modo', m)
+        estado['modo'] = m
+        return jsonify(modo=m)
+    return jsonify(error='modo invalido'), 400
+
+@app.route('/status')
+def status_route():
+    with _lock:
+        out = dict(estado)
+        out.update({
+            'flow_unlocked': config.get('flow_calibrated', False),
+            'flow_lpm':      float(config.get('flow_lpm', 0.0)),
+            'flow_gauge_max': float(config.get('flow_gauge_max', 15.0)),
+            'volume_session_l': float(volume_session_l),
+            'volume_today_l':   float(volume_today_l),
+            'simulado': SIMULADO,
+            'sim_err': SIM_ERR,
+            'serial_port': PORTA_SERIAL,
+            'baud': BAUD_RATE
+        })
+    return jsonify(out)
+
+@app.route('/historico')
+def get_historico():
+    secs = int(request.args.get('secs', 3600))
+    return jsonify(_historico_window(secs))
+
+@app.route('/historico.csv')
+def get_historico_csv():
+    secs = int(request.args.get('secs', 3600))
+    data = _historico_window(secs)
+    si = io.StringIO()
+    w = csv.writer(si)
+    w.writerow(['ts','datetime','umidade','status','pump','modo'])
+    for d in data:
+        w.writerow([f"{d['ts']:.3f}", time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(d['ts'])), d['umidade'], d['status'], int(d['pump']), d['modo']])
+    out = si.getvalue().encode('utf-8')
+    return Response(out, mimetype='text/csv', headers={'Content-Disposition':'attachment; filename="historico.csv"'})
+
+@app.route('/eventos')
+def get_eventos():
+    limit = int(request.args.get('limit', 200))
+    with _lock:
+        arr = list(eventos)[-limit:]
+    return jsonify(arr[::-1])
+
+@app.route('/timeline')
+def timeline():
+    secs = int(request.args.get('secs', 86400))
+    return jsonify(_build_timeline(secs))
+
+@app.route('/config', methods=['GET','POST'])
+def cfg():
+    global config
+    if request.method == 'POST':
+        data = request.get_json(silent=True) or {}
+        if 'umidade_alvo' in data:
+            try: config['umidade_alvo'] = float(data['umidade_alvo'])
+            except: pass
+        if 'refresh_ms' in data:
+            try: 
+                config['refresh_ms'] = int(data['refresh_ms'])
+            except: 
+                pass
+        return jsonify(config)
+    return jsonify(config)
+
+@app.route('/flow/calibrate', methods=['POST'])
+def flow_calibrate():
+    data = request.get_json(silent=True) or {}
+    secs = data.get('seconds')
+    try:
+        secs = float(secs)
+    except:
+        return jsonify(ok=False, error="seconds inválido"), 400
+    if secs <= 0:
+        return jsonify(ok=False, error="seconds <= 0"), 400
+    lpm = 60.0 / secs
+    config['flow_1l_seconds'] = secs
+    config['flow_lpm'] = lpm
+    config['flow_calibrated'] = True
+    return jsonify(ok=True, flow_lpm=lpm)
+
+@app.route('/flow/reset_today', methods=['POST'])
+def flow_reset_today():
+    global volume_today_l, today_ymd
+    with _lock:
+        volume_today_l = 0.0
+        today_ymd = datetime.now().strftime('%Y-%m-%d')
+    return jsonify(ok=True)
+
+# ======= DEBUG SERIAL =======
+def _ls_ports():
+    paths = glob.glob('/dev/ttyACM*') + glob.glob('/dev/ttyUSB*') + glob.glob('/dev/ttyAMA*')
+    info = []
+    for p in paths:
+        try:
+            st = os.stat(p)
+            mode = oct(st.st_mode & 0o777)
+            info.append({'path': p, 'mode': mode})
+        except Exception as e:
+            info.append({'path': p, 'err': repr(e)})
+    return info
+
+@app.route('/serial/info')
+def serial_info():
+    return jsonify({
+        'simulado': SIMULADO, 'sim_err': SIM_ERR,
+        'porta_configurada': PORTA_SERIAL, 'baud': BAUD_RATE,
+        'disponiveis': _ls_ports()
+    })
+
+@app.route('/serial/reopen', methods=['POST'])
+def serial_reopen():
+    global ser, SIMULADO, SIM_ERR, PORTA_SERIAL, BAUD_RATE
+    port = request.args.get('port', PORTA_SERIAL)
+    try:
+        baud = int(request.args.get('baud', BAUD_RATE))
+    except:
+        baud = BAUD_RATE
+    try:
+        if ser:
+            try: ser.close()
+            except: pass
+        import serial  # noqa
+        ser = serial.Serial(port, baud, timeout=1)
+        time.sleep(2)
+        ser.reset_input_buffer()
+        PORTA_SERIAL = port; BAUD_RATE = baud
+        SIMULADO = False; SIM_ERR = None
+        app.logger.info("Serial reaberta em %s @ %d", port, baud)
+        return jsonify(ok=True, port=port, baud=baud)
+    except Exception as e:
+        SIM_ERR = repr(e); SIMULADO = True; ser = None
+        app.logger.info("Falha ao reabrir serial: %r", e)
+        return jsonify(ok=False, error=SIM_ERR), 500
+
+# ---------- Main ----------
+if __name__ == '__main__':
+    print("AquaPulse iniciado. SIMULADO=%s Porta=%s" % (str(SIMULADO), "5000"))
+    app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
